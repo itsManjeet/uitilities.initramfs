@@ -1,0 +1,185 @@
+#!/bin/sh
+
+PATH=/bin:/usr/bin:/sbin:/usr/sbin
+export PATH
+
+function SystemResume {
+    case "$resume" in
+        UUID=*)
+            eval $resume
+            resume="/dev/disk/by-uuid/$UUID"
+            ;;
+
+        LABEL=*)
+            eval $resume
+            resume="/dev/disk/by-label/$LABEL"
+            ;;
+
+    esac
+
+    if $noresume || ! [ -b "$resume" ] ; then
+        return
+    fi
+
+    ls -lH "$resume" | ( read x x x x maj main x 
+        echo -n ${maj%,}:$min >/sys/power/resume )
+}
+
+function SystemGetDevice {
+
+    case "$root" in
+        /dev/*) 
+            device=$root
+            ;;
+
+        UUID=*) 
+            eval $root
+            device="/dev/disk/by-uuid/$UUID"
+            ;;
+
+        LABEL=*)
+            eval $root
+            device="/dev/disk/by-label/$LABEL"
+            ;;
+
+        *)
+            echo "No Root device specified."
+            SystemRescue 
+            ;;
+    esac
+
+    while [ ! -b "$device" ] ; do
+        ErrorNoDevice "$device"
+        SystemRescue
+    done
+}
+
+function SystemMount {
+    install -d /.root
+    [ -n  "$rootflags" ] && rootflags="$rootflags,"
+    rootflags="$rootflags$ro"
+
+    SystemGetDevice
+
+    if ! mount -n -t "$rootfstype" -o "$rootflags" "$device" /.root ; then
+        ErrorNoDevice $device
+        cat /proc/partitions
+        while true ; do sleep 10000; done
+    else
+        echo "successfully mounted $root"
+    fi
+}
+
+function SystemRescue {
+    echo -e "error occured while booting\nDropping to rescue shell\n"
+    /bin/sh
+}
+
+function SystemBootSquashfs {
+
+    SystemGetDevice
+
+    initramfsDir="/run/initramfs"
+    medium=$initramfsDir/medium
+    system=$initramfsDir/system
+    rwdir=$initramfsDir/overlay/write
+    wrkdir=$initramfsDir/overlay/work
+    newroot=/.newroot
+
+    mkdir -p $medium $system $rwdir $wrkdir $newroot
+
+    mount -o ro $device $medium || SystemRescue
+    lowerDir=""
+
+    for l in $medium/$squashfs/*.squa ; do
+        imgName=$(basename $i | sed 's|.squa||g')
+        echo "enabling $imgName"
+        mkdir -p $system/$imgName
+        squa=$(losetup --find --show --read-only $i)
+        mount -o defaults -r $squa $system/$imgName || SystemRescue
+        lowerDir="$system/$imgName:$lowerDir"
+    done
+
+    lowerDir=${lowerDir::-1}
+
+    mount -t overlay overlay -o upperdir=$rwdir,lowerdir=$lowerDir,workdir=$wrkdir $newroot || SystemRescue
+
+    touch $newroot/fastboot
+
+}
+
+
+function ErrorNoDevice {
+    echo "Device $1 not exist"
+}
+
+function ErrorNoMount {
+    echo "Error occured while mounting $1"
+}
+
+init=/sbin/init
+root=
+rootdelay=0
+rootfstype=auto
+ro="ro"
+rootflags=
+device=
+resume=
+noresume=false
+squashfs=
+cdrom=false
+newroot="/.root"
+
+mount -n -t devtmpfs devtmpfs /dev
+mount -n -t proc     proc     /proc
+mount -n -t sysfs    sysfs    /sys
+mount -n -t tmpfs    tmpfs    /run
+
+read -r cmdline < /proc/cmdline
+
+for param in $cmdline; do
+    case $param in
+        init=*       )   init=${param#init=}             ;;
+        root=*       )   root=${param#root=}             ;;
+        rootdelay=*  )   rootdelay=${param#rootdelay=}   ;;
+        rootfstype=* )   rootfstype=${param#rootfstype=} ;;
+        rootflags=*  )   rootflags=${param#rootflags=}   ;;
+        resume=*     )   resume=${param#resume=}         ;;
+        noresume     )   noresume=true                   ;;
+        ro           )   ro="ro"                         ;;
+        rw           )   ro="rw"                         ;;
+        squashfs=*   )   squashfs=${param#squashfs=}     ;;
+        cdrom        )   cdrom=true                      ;;
+    esac
+done
+
+
+udevd --daemon --resolve-names=never
+udevadm trigger --action=add --type=subsystems
+udevadm trigger --action=add --type=devices
+udevadm trigger --action=change --type=devices
+udevadm settle
+
+[ -f /etc/mdadm.conf ] && mdadm -As
+[ -x /bin/vgchange   ] && vgchange -a y >/dev/null 
+[ -n "$rootdelay"    ] && sleep "$rootdelay"
+
+# SystemResume
+
+if $cdrom ; then
+    modprobe cdrom
+fi
+
+if [ -n "$squashfs" ] ; then
+    for mod in loop overlay ; do
+        modprobe $mod
+    done
+
+    SystemBootSquashfs $squashfs || SystemRescue
+else
+    SystemMount
+fi
+
+killall -w udevd
+
+exec switch_root $newroot "$init" "$@"

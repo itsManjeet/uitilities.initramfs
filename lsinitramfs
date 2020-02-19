@@ -1,0 +1,6 @@
+#!/bin/sh
+
+toSkan=/boot/initramfs.img
+[ $1 ] && toSkan="$1"
+
+gzip -dc $toSkan | bsdcpio -it
